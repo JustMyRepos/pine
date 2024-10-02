@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <vector>
+#include <any>
 #include <shared_mutex>
 #include <jni.h>
 #include <android/log.h>
@@ -37,6 +39,7 @@ static size_t page_size_ = static_cast<const size_t>(sysconf(_SC_PAGESIZE));
 static std::unordered_set<void*> cared_classes_;
 static std::unordered_map<void*, void*> hooked_methods_;
 static std::unordered_map<void*, const void*> pending_entries_;
+static std::unordered_map<void*, std::vector<std::any>> pending_entries_lollipop_;
 static std::mutex cared_classes_mutex_;
 static std::shared_mutex hooked_methods_mutex_;
 static std::mutex pending_entries_mutex_;
@@ -176,6 +179,24 @@ HOOK_ENTRY(UpdateMethodsCode, void, void* thiz, void* method, const void* quick_
     backup_UpdateMethodsCode(thiz, method, quick_code);
 }
 
+HOOK_ENTRY(UpdateMethodsCodeLollipop, void, void* thiz, void* method, const void* quick_code, const void* portable_code, bool have_portable_code) {
+    instrumentation_ = thiz;
+    if (IsMethodHooked(method, true)) {
+        auto backup = GetMethodBackup(method);
+        if (backup) {
+            // Redirect entry update to backup
+            method = backup;
+        } else {
+            ScopedLock lk(pending_entries_mutex_);
+            std::vector<std::any> params = { quick_code, portable_code, have_portable_code };
+            pending_entries_lollipop_[method] = params;
+            return;
+        }
+    }
+
+    backup_UpdateMethodsCodeLollipop(thiz, method, quick_code, portable_code, have_portable_code);
+}
+
 HOOK_ENTRY(UpdateMethodsCodeImpl, void, void* thiz, void* method, const void* quick_code) {
     if (PreUpdateMethodsCode(thiz, method, quick_code)) return;
     backup_UpdateMethodsCodeImpl(thiz, method, quick_code);
@@ -207,16 +228,32 @@ void PineEnhances_recordMethodHooked(JNIEnv*, jclass, jlong method, jlong backup
         std::unique_lock<std::shared_mutex> lk(hooked_methods_mutex_);
         hooked_methods_[o] = b;
     }
-    if (!(instrumentation_ && backup_UpdateMethodsCode)) return;
-    const void* saved_entry;
-    {
-        ScopedLock lk(pending_entries_mutex_);
-        auto i = pending_entries_.find(o);
-        if (i == pending_entries_.end()) return;
-        saved_entry = i->second;
-        pending_entries_.erase(i);
+    if (!(instrumentation_ && (backup_UpdateMethodsCode || backup_UpdateMethodsCodeLollipop))) return;
+    if (backup_UpdateMethodsCodeLollipop) {
+        const void* saved_quick_code;
+        const void* saved_portable_code;
+        bool saved_have_portable_code;
+        {
+            ScopedLock lk(pending_entries_mutex_);
+            auto i = pending_entries_lollipop_.find(o);
+            if (i == pending_entries_lollipop_.end()) return;
+            saved_quick_code = std::any_cast<const void*>(i->second[0]);
+            saved_portable_code = std::any_cast<const void*>(i->second[1]);
+            saved_have_portable_code = std::any_cast<bool>(i->second[2]);
+            pending_entries_lollipop_.erase(i);
+        }
+        backup_UpdateMethodsCodeLollipop(instrumentation_, b, saved_quick_code, saved_portable_code, saved_have_portable_code);
+    } else {
+        const void* saved_entry;
+        {
+            ScopedLock lk(pending_entries_mutex_);
+            auto i = pending_entries_.find(o);
+            if (i == pending_entries_.end()) return;
+            saved_entry = i->second;
+            pending_entries_.erase(i);
+        }
+        backup_UpdateMethodsCode(instrumentation_, b, saved_entry);
     }
-    backup_UpdateMethodsCode(instrumentation_, b, saved_entry);
 }
 
 std::string GetRuntimeLibraryName(JNIEnv* env) {
@@ -297,7 +334,9 @@ jboolean PineEnhances_initClassInitMonitor(JNIEnv* env, jclass PineEnhances, jin
 
          HOOK_SYMBOL(UpdateMethodsCodeImpl, "_ZN3art15instrumentation15Instrumentation21UpdateMethodsCodeImplEPNS_9ArtMethodEPKv");
      }
-     else
+     else if (sdk_level == __ANDROID_API_L__ || sdk_level == __ANDROID_API_L_MR1__) {
+         HOOK_SYMBOL(UpdateMethodsCodeLollipop, "_ZN3art15instrumentation15Instrumentation17UpdateMethodsCodeEPNS_6mirror9ArtMethodEPKvS6_b");
+     } else
          HOOK_SYMBOL(UpdateMethodsCode, "_ZN3art15instrumentation15Instrumentation17UpdateMethodsCodeEPNS_9ArtMethodEPKv");
      if (sdk_level >= __ANDROID_API_T__) {
          HOOK_SYMBOL(InitializeMethodsCode, "_ZN3art15instrumentation15Instrumentation21InitializeMethodsCodeEPNS_9ArtMethodEPKv");
